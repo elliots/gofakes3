@@ -1,4 +1,4 @@
-package s3mem
+package versionid
 
 import (
 	"encoding/base32"
@@ -11,21 +11,21 @@ import (
 
 var add1 = new(big.Int).SetInt64(1)
 
-type versionGenerator struct {
+type VersionGenerator struct {
 	state uint64
 	size  int
 	next  *big.Int
 	mu    sync.Mutex
 }
 
-func newVersionGenerator(seed uint64, size int) *versionGenerator {
+func NewVersionGenerator(seed uint64, size int) *VersionGenerator {
 	if size <= 0 {
 		size = 64
 	}
-	return &versionGenerator{next: new(big.Int), state: seed}
+	return &VersionGenerator{next: new(big.Int), state: seed}
 }
 
-func (v *versionGenerator) Next(scratch []byte) (gofakes3.VersionID, []byte) {
+func (v *VersionGenerator) Next(scratch []byte) (gofakes3.VersionID, []byte) {
 	v.mu.Lock()
 
 	v.next.Add(v.next, add1)

@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"github.com/cevatbarisyilmaz/ara"
 	"io"
 	"io/ioutil"
 	"log"
@@ -30,6 +29,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/cevatbarisyilmaz/ara"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -217,11 +218,11 @@ func newTestServer(t *testing.T, opts ...testServerOption) *testServer {
 	}
 
 	if ts.versioning {
-		mem, ok := ts.backend.(*s3mem.Backend)
+		versioned, ok := ts.backend.(gofakes3.VersionedBackend)
 		if !ok {
 			panic("backend is not a versioned backend")
 		}
-		ts.versioned = mem
+		ts.versioned = versioned
 		for _, bucket := range ts.initialBuckets {
 			ts.TT.OK(ts.versioned.SetVersioningConfiguration(bucket, gofakes3.VersioningConfiguration{
 				Status: gofakes3.VersioningEnabled,

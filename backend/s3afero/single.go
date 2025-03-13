@@ -219,6 +219,8 @@ func (db *SingleBucketBackend) ensureMeta(
 			size,
 			hash,
 			map[string]string{},
+			"",
+			false,
 		}, nil
 
 	} else if err != nil {

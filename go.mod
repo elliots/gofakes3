@@ -1,6 +1,6 @@
 module github.com/johannesboyne/gofakes3
 
-go 1.16
+go 1.18
 
 require (
 	github.com/aws/aws-sdk-go v1.44.256
@@ -12,4 +12,13 @@ require (
 	go.shabbyrobe.org/gocovmerge v0.0.0-20230507111327-fa4f82cfbf4d
 	golang.org/x/tools v0.8.0
 	gopkg.in/mgo.v2 v2.0.0-20180705113604-9856a29383ce
+)
+
+require (
+	github.com/davecgh/go-spew v1.1.0 // indirect
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	golang.org/x/sys v0.7.0 // indirect
+	golang.org/x/text v0.4.0 // indirect
+	gopkg.in/yaml.v2 v2.2.8 // indirect
 )

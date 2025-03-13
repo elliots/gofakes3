@@ -8,6 +8,7 @@ import (
 
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/internal/goskipiter"
+	"github.com/johannesboyne/gofakes3/internal/versionid"
 )
 
 var (
@@ -18,7 +19,7 @@ var (
 type Backend struct {
 	buckets          map[string]*bucket
 	timeSource       gofakes3.TimeSource
-	versionGenerator *versionGenerator
+	versionGenerator *versionid.VersionGenerator
 	versionSeed      int64
 	versionSeedSet   bool
 	versionScratch   []byte
@@ -50,9 +51,9 @@ func New(opts ...Option) *Backend {
 	}
 	if b.versionGenerator == nil {
 		if b.versionSeedSet {
-			b.versionGenerator = newVersionGenerator(uint64(b.versionSeed), 0)
+			b.versionGenerator = versionid.NewVersionGenerator(uint64(b.versionSeed), 0)
 		} else {
-			b.versionGenerator = newVersionGenerator(uint64(b.timeSource.Now().UnixNano()), 0)
+			b.versionGenerator = versionid.NewVersionGenerator(uint64(b.timeSource.Now().UnixNano()), 0)
 		}
 	}
 	return b

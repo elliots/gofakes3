@@ -1,4 +1,4 @@
-package s3mem
+package versionid
 
 import (
 	"strings"
@@ -8,7 +8,7 @@ import (
 )
 
 func TestVersionID(t *testing.T) {
-	vid := newVersionGenerator(0, 32)
+	vid := NewVersionGenerator(0, 32)
 
 	var last gofakes3.VersionID
 	for i := 0; i < 1000; i++ {

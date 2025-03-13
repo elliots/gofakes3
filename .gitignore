@@ -7,3 +7,5 @@ s3f_*
 *.test
 *.out
 build/
+
+tmpdata/

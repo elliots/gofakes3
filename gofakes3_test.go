@@ -20,7 +20,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/johannesboyne/gofakes3"
+	"github.com/johannesboyne/gofakes3/backend/s3afero"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
+	"github.com/spf13/afero"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCreateBucket(t *testing.T) {
@@ -937,7 +940,7 @@ func TestVersioning(t *testing.T) {
 }
 
 func TestObjectVersions(t *testing.T) {
-	create := func(ts *testServer, bucket, key string, contents []byte, version string) {
+	create := func(t *testing.T, ts *testServer, bucket, key string, contents []byte) *string {
 		ts.Helper()
 		svc := ts.s3Client()
 		out, err := svc.PutObject(&s3.PutObjectInput{
@@ -945,13 +948,17 @@ func TestObjectVersions(t *testing.T) {
 			Key:    aws.String(key),
 			Body:   bytes.NewReader(contents),
 		})
-		ts.OK(err)
-		if aws.StringValue(out.VersionId) != version {
-			t.Fatal("version ID mismatch. found:", aws.StringValue(out.VersionId), "expected:", version)
+		require.NoError(t, err)
+		// In this test, we aren't going to verify the exact version ID strings since they will differ
+		// between memory and file backends. We just verify that version IDs are generated.
+		if aws.StringValue(out.VersionId) == "" {
+			t.Error("Expected a version ID but got none")
+			t.FailNow()
 		}
+		return out.VersionId
 	}
 
-	get := func(ts *testServer, bucket, key string, contents []byte, version string) {
+	get := func(t *testing.T, ts *testServer, bucket, key string, contents []byte, version string) {
 		ts.Helper()
 		svc := ts.s3Client()
 		input := &s3.GetObjectInput{
@@ -962,16 +969,16 @@ func TestObjectVersions(t *testing.T) {
 			input.VersionId = aws.String(version)
 		}
 		out, err := svc.GetObject(input)
-		ts.OK(err)
+		require.NoError(t, err)
 		defer out.Body.Close()
-		bts, err := ioutil.ReadAll(out.Body)
-		ts.OK(err)
+		bts, err := io.ReadAll(out.Body)
+		require.NoError(t, err)
 		if !bytes.Equal(bts, contents) {
-			ts.Fatal("body mismatch. found:", string(bts), "expected:", string(contents))
+			t.Fatal("body mismatch. found:", string(bts), "expected:", string(contents))
 		}
 	}
 
-	deleteVersion := func(ts *testServer, bucket, key, version string) {
+	deleteVersion := func(t *testing.T, ts *testServer, bucket, key, version string) {
 		ts.Helper()
 		svc := ts.s3Client()
 		input := &s3.DeleteObjectInput{
@@ -981,10 +988,11 @@ func TestObjectVersions(t *testing.T) {
 		if version != "" {
 			input.VersionId = aws.String(version)
 		}
-		ts.OKAll(svc.DeleteObject(input))
+		_, err := svc.DeleteObject(input)
+		require.NoError(t, err)
 	}
 
-	deleteDirect := func(ts *testServer, bucket, key, version string) {
+	deleteDirect := func(t *testing.T, ts *testServer, bucket, key string) string {
 		ts.Helper()
 		svc := ts.s3Client()
 		input := &s3.DeleteObjectInput{
@@ -992,17 +1000,16 @@ func TestObjectVersions(t *testing.T) {
 			Key:    aws.String(key),
 		}
 		out, err := svc.DeleteObject(input)
-		ts.OK(err)
-		if aws.StringValue(out.VersionId) != version {
-			t.Fatal("version ID mismatch. found:", aws.StringValue(out.VersionId), "expected:", version)
-		}
+		require.NoError(t, err)
+		require.NotNil(t, out.VersionId)
+		return *out.VersionId
 	}
 
-	list := func(ts *testServer, bucket string, versions ...string) {
+	list := func(t *testing.T, ts *testServer, bucket string, expectedVersions ...string) {
 		ts.Helper()
 		svc := ts.s3Client()
 		out, err := svc.ListObjectVersions(&s3.ListObjectVersionsInput{Bucket: aws.String(bucket)})
-		ts.OK(err)
+		require.NoError(t, err)
 
 		var found []string
 		for _, ver := range out.Versions {
@@ -1016,63 +1023,119 @@ func TestObjectVersions(t *testing.T) {
 		// DeleteMarkers, which are sibling elements in the XML body but separated
 		// into different lists by the client:
 		sort.Strings(found)
-		sort.Strings(versions)
-		if !reflect.DeepEqual(found, versions) {
-			ts.Fatal("versions mismatch. found:", found, "expected:", versions)
+		sort.Strings(expectedVersions)
+		if !reflect.DeepEqual(found, expectedVersions) {
+			t.Error("versions mismatch. found:", found, "expected:", expectedVersions)
+			t.FailNow()
 		}
 	}
 
-	// XXX: version IDs are brittle; we control the seed, but the format may
-	// change at any time.
-	const v1 = "3/60O30C1G60O30C1G60O30C1G60O30C1G60O30C1G60O30C1H03F9QN5V72K21OG="
-	const v2 = "3/60O30C1G60O30C1G60O30C1G60O30C1G60O30C1G60O30C1I00G5II3TDAF7GRG="
-	const v3 = "3/60O30C1G60O30C1G60O30C1G60O30C1G60O30C1G60O30C1J01VFV0CD31ES81G="
-
 	t.Run("put-list-delete-versions", func(t *testing.T) {
-		ts := newTestServer(t, withVersioning())
-		defer ts.Close()
+		// common test
+		test := func(t *testing.T, ts *testServer, objectName string) {
+			v1 := create(t, ts, defaultBucket, objectName, []byte("body 1"))
+			require.NotNil(t, v1)
+			get(t, ts, defaultBucket, objectName, []byte("body 1"), "")
+			list(t, ts, defaultBucket, *v1)
 
-		create(ts, defaultBucket, "object", []byte("body 1"), v1)
-		get(ts, defaultBucket, "object", []byte("body 1"), "")
-		list(ts, defaultBucket, v1)
+			v2 := create(t, ts, defaultBucket, objectName, []byte("body 2"))
+			require.NotNil(t, v2)
+			get(t, ts, defaultBucket, objectName, []byte("body 2"), "")
+			list(t, ts, defaultBucket, *v1, *v2)
 
-		create(ts, defaultBucket, "object", []byte("body 2"), v2)
-		get(ts, defaultBucket, "object", []byte("body 2"), "")
-		list(ts, defaultBucket, v1, v2)
+			v3 := create(t, ts, defaultBucket, objectName, []byte("body 3"))
+			require.NotNil(t, v3)
+			get(t, ts, defaultBucket, objectName, []byte("body 3"), "")
+			list(t, ts, defaultBucket, *v1, *v2, *v3)
 
-		create(ts, defaultBucket, "object", []byte("body 3"), v3)
-		get(ts, defaultBucket, "object", []byte("body 3"), "")
-		list(ts, defaultBucket, v1, v2, v3)
+			get(t, ts, defaultBucket, objectName, []byte("body 1"), *v1)
+			get(t, ts, defaultBucket, objectName, []byte("body 2"), *v2)
+			get(t, ts, defaultBucket, objectName, []byte("body 3"), *v3)
+			get(t, ts, defaultBucket, objectName, []byte("body 3"), "")
 
-		get(ts, defaultBucket, "object", []byte("body 1"), v1)
-		get(ts, defaultBucket, "object", []byte("body 2"), v2)
-		get(ts, defaultBucket, "object", []byte("body 3"), v3)
-		get(ts, defaultBucket, "object", []byte("body 3"), "")
+			deleteVersion(t, ts, defaultBucket, objectName, *v1)
+			list(t, ts, defaultBucket, *v2, *v3)
+			deleteVersion(t, ts, defaultBucket, objectName, *v2)
+			list(t, ts, defaultBucket, *v3)
+			deleteVersion(t, ts, defaultBucket, objectName, *v3)
+			list(t, ts, defaultBucket)
+		}
 
-		deleteVersion(ts, defaultBucket, "object", v1)
-		list(ts, defaultBucket, v2, v3)
-		deleteVersion(ts, defaultBucket, "object", v2)
-		list(ts, defaultBucket, v3)
-		deleteVersion(ts, defaultBucket, "object", v3)
-		list(ts, defaultBucket)
+		// run the test with both afero and mem backend
+		t.Run("mem", func(t *testing.T) {
+			ts := newTestServer(t, withVersioning())
+			defer ts.Close()
+
+			t.Run("file in root", func(t *testing.T) {
+				test(t, ts, "object")
+			})
+
+			t.Run("file in dir", func(t *testing.T) {
+				test(t, ts, "subdir/object")
+			})
+		})
+
+		t.Run("fs/multi", func(t *testing.T) {
+			fs := afero.NewMemMapFs()
+
+			// var flags s3afero.FsFlags
+			// flags |= s3afero.FsPathCreateAll
+
+			// // delete tmpdata and tmpmeta directories
+			// err := os.RemoveAll("./tmpdata/fs-multi")
+			// require.NoError(t, err)
+
+			// fs, err := s3afero.FsPath("./tmpdata/fs-multi", flags)
+			// require.NoError(t, err)
+
+			backend, err := s3afero.MultiBucket(fs, s3afero.MultiWithVersionSeed(1))
+			require.NoError(t, err)
+			ts := newTestServer(t, withVersioning(), withBackend(backend))
+			defer ts.Close()
+
+			t.Run("file in root", func(t *testing.T) {
+				test(t, ts, "object")
+			})
+			t.Run("file in dir", func(t *testing.T) {
+				test(t, ts, "subdir/object")
+			})
+		})
+
 	})
 
 	t.Run("delete-direct", func(t *testing.T) {
-		ts := newTestServer(t, withVersioning())
+		fs := afero.NewMemMapFs()
+
+		// var flags s3afero.FsFlags
+		// flags |= s3afero.FsPathCreateAll
+
+		// // delete tmpdata and tmpmeta directories
+		// err := os.RemoveAll("./tmpdata/delete-direct")
+		// require.NoError(t, err)
+
+		// fs, err := s3afero.FsPath("./tmpdata/delete-direct", flags)
+		// require.NoError(t, err)
+
+		backend, err := s3afero.MultiBucket(fs, s3afero.MultiWithVersionSeed(1))
+		require.NoError(t, err)
+		ts := newTestServer(t, withVersioning(), withBackend(backend))
+
 		defer ts.Close()
 
-		create(ts, defaultBucket, "object", []byte("body 1"), v1)
-		list(ts, defaultBucket, v1)
-		create(ts, defaultBucket, "object", []byte("body 2"), v2)
-		list(ts, defaultBucket, v1, v2)
+		v1 := create(t, ts, defaultBucket, "object", []byte("body 1"))
+		require.NotNil(t, v1)
+		list(t, ts, defaultBucket, *v1)
+		v2 := create(t, ts, defaultBucket, "object", []byte("body 2"))
+		require.NotNil(t, v2)
+		list(t, ts, defaultBucket, *v1, *v2)
 
-		get(ts, defaultBucket, "object", []byte("body 2"), "")
+		get(t, ts, defaultBucket, "object", []byte("body 2"), "")
 
-		deleteDirect(ts, defaultBucket, "object", v3)
-		list(ts, defaultBucket, v1, v2, v3)
+		v3 := deleteDirect(t, ts, defaultBucket, "object")
+		list(t, ts, defaultBucket, *v1, *v2, v3)
 
 		svc := ts.s3Client()
-		_, err := svc.GetObject(&s3.GetObjectInput{
+		_, err = svc.GetObject(&s3.GetObjectInput{
 			Bucket: aws.String(defaultBucket),
 			Key:    aws.String("object"),
 		})
@@ -1089,7 +1152,7 @@ func TestObjectVersions(t *testing.T) {
 		ts.backendCreateBucket(neverVerBucket)
 
 		ts.backendPutString(neverVerBucket, "object", nil, "body 1")
-		list(ts, neverVerBucket, "null") // S300005
+		list(t, ts, neverVerBucket, "null") // S300005
 	})
 }
 

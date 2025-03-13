@@ -12,7 +12,10 @@ import (
 	"github.com/spf13/afero"
 )
 
+// Define emptyPrefix here
 var emptyPrefix = &gofakes3.Prefix{}
+
+
 
 type readerWithCloser struct {
 	io.Reader
