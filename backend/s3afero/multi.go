@@ -2,6 +2,7 @@ package s3afero
 
 import (
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/afero"
 
@@ -26,12 +28,18 @@ import (
 // `/buckets` subdirectory as that could make a significant mess, but this is
 // infeasible to validate, so you're encouraged to be extremely careful!
 type MultiBucketBackend struct {
-	lock      sync.Mutex
-	baseFs    afero.Fs
-	bucketFs  afero.Fs
-	metaStore *metaStore
-	dirMode   os.FileMode
-	flags     FsFlags
+	lock             sync.Mutex
+	baseFs           afero.Fs
+	bucketFs         afero.Fs
+	metaStore        *metaStore
+	dirMode          os.FileMode
+	flags            FsFlags
+	versionGenerator *versionGenerator
+	versionScratch   []byte
+	timeSource       gofakes3.TimeSource
+
+	// versioning stores the versioning status per bucket
+	versioning map[string]gofakes3.VersioningStatus
 
 	// FIXME(bw): values in here should not be used beyond the configuration
 	// step; maybe this can be cleaned up later using a builder struct or
@@ -42,6 +50,7 @@ type MultiBucketBackend struct {
 }
 
 var _ gofakes3.Backend = &MultiBucketBackend{}
+var _ gofakes3.VersionedBackend = &MultiBucketBackend{}
 
 func MultiBucket(fs afero.Fs, opts ...MultiOption) (*MultiBucketBackend, error) {
 	if err := ensureNoOsFs("fs", fs); err != nil {
@@ -60,9 +69,14 @@ func MultiBucket(fs afero.Fs, opts ...MultiOption) (*MultiBucketBackend, error) 
 		return nil, err
 	}
 
+	timeSource := gofakes3.DefaultTimeSource()
+
 	b.baseFs = fs
 	b.bucketFs = bucketsFs
 	b.dirMode = 0700
+	b.versioning = make(map[string]gofakes3.VersioningStatus)
+	b.versionGenerator = newVersionGenerator(uint64(timeSource.Now().UnixNano()), 0)
+	b.timeSource = timeSource
 
 	if b.configOnly.metaFs == nil {
 		metaFs, err := NewBasePathFs(fs, "metadata", FsPathCreateAll)
@@ -338,7 +352,7 @@ func (db *MultiBucketBackend) HeadObject(bucketName, objectName string) (*gofake
 
 	size, mtime := stat.Size(), stat.ModTime()
 
-	meta, err := db.metaStore.loadMeta(bucketName, objectName, size, mtime)
+	meta, err := db.ensureMeta(bucketName, objectName, size, mtime)
 	if err != nil {
 		return nil, err
 	}
@@ -401,18 +415,19 @@ func (db *MultiBucketBackend) GetObject(bucketName, objectName string, rangeRequ
 		rdr = limitReadCloser(rdr, f.Close, rnge.Length)
 	}
 
-	meta, err := db.metaStore.loadMeta(bucketName, objectName, size, mtime)
+	meta, err := db.ensureMeta(bucketName, objectName, size, mtime)
 	if err != nil {
 		return nil, err
 	}
 
 	return &gofakes3.Object{
-		Name:     objectName,
-		Hash:     meta.Hash,
-		Metadata: meta.Meta,
-		Range:    rnge,
-		Size:     size,
-		Contents: rdr,
+		Name:      objectName,
+		Hash:      meta.Hash,
+		Metadata:  meta.Meta,
+		Range:     rnge,
+		Size:      size,
+		VersionID: gofakes3.VersionID(meta.VersionID),
+		Contents:  rdr,
 	}, nil
 }
 
@@ -447,6 +462,43 @@ func (db *MultiBucketBackend) PutObject(
 		}
 		if err := gofakes3.CheckPutConditions(conditions, objectInfo); err != nil {
 			return result, err
+		}
+	}
+
+	// If versioning is enabled, generate version ID and possibly move existing version
+	var versionID gofakes3.VersionID
+	if db.versioning[bucketName] == gofakes3.VersioningEnabled {
+		// Generate version ID for the NEW version being created
+		versionID = db.nextVersion()
+
+		// Check if object already exists - if so, move it to versions with its OLD version ID
+		objectPath := path.Join(bucketName, objectName)
+		objectFilePath := filepath.FromSlash(objectPath)
+		stat, err := db.bucketFs.Stat(objectFilePath)
+		if err == nil {
+			// Load the old version's metadata to get its version ID
+			oldMeta, err := db.metaStore.loadMeta(bucketName, objectName, stat.Size(), stat.ModTime())
+			if err != nil {
+				return result, err
+			}
+
+			// The old version ID should be stored in metadata
+			oldVersionID := gofakes3.VersionID(oldMeta.VersionID)
+			if oldVersionID == "" {
+				// This shouldn't happen with versioning enabled, but handle it gracefully
+				return result, fmt.Errorf("versioning enabled but no version ID in metadata")
+			}
+
+			// Move current version to .versions directory
+			if err := db.moveToVersions(bucketName, objectName, oldVersionID); err != nil {
+				return result, err
+			}
+
+			// Save metadata for the old version
+			oldMetaPath := db.metaStore.metaPath(bucketName, objectName+"-version-"+string(oldVersionID))
+			if err := db.metaStore.saveMeta(oldMetaPath, oldMeta); err != nil {
+				return result, err
+			}
 		}
 	}
 
@@ -493,14 +545,20 @@ func (db *MultiBucketBackend) PutObject(
 	}
 
 	storedMeta := &Metadata{
-		File:    objectPath,
-		Hash:    hasher.Sum(nil),
-		Meta:    meta,
-		Size:    stat.Size(),
-		ModTime: stat.ModTime(),
+		File:      objectPath,
+		Hash:      hasher.Sum(nil),
+		Meta:      meta,
+		Size:      stat.Size(),
+		ModTime:   stat.ModTime(),
+		VersionID: string(versionID), // Store version ID in metadata
 	}
 	if err := db.metaStore.saveMeta(db.metaStore.metaPath(bucketName, objectName), storedMeta); err != nil {
 		return result, err
+	}
+
+	// Return version ID if versioning is enabled
+	if db.versioning[bucketName] == gofakes3.VersioningEnabled {
+		result.VersionID = versionID
 	}
 
 	return result, nil
@@ -520,6 +578,42 @@ func (db *MultiBucketBackend) DeleteObject(bucketName, objectName string) (resul
 		return result, err
 	} else if !exists {
 		return result, gofakes3.BucketNotFound(bucketName)
+	}
+
+	// If versioning is enabled, create a delete marker instead of actually deleting
+	if db.versioning[bucketName] == gofakes3.VersioningEnabled {
+		// Check if object exists
+		objectPath := path.Join(bucketName, objectName)
+		objectFilePath := filepath.FromSlash(objectPath)
+		if _, err := db.bucketFs.Stat(objectFilePath); err == nil {
+			// Generate version ID for the CURRENT version before moving it
+			oldVersionID := db.nextVersion()
+
+			// Move current version to .versions directory
+			if err := db.moveToVersions(bucketName, objectName, oldVersionID); err != nil {
+				return result, err
+			}
+
+			// Copy metadata for the old version
+			oldMeta, err := db.metaStore.loadMeta(bucketName, objectName, 0, time.Time{})
+			if err == nil {
+				oldMetaPath := db.metaStore.metaPath(bucketName, objectName+"-version-"+string(oldVersionID))
+				if err := db.metaStore.saveMeta(oldMetaPath, oldMeta); err != nil {
+					return result, err
+				}
+			}
+
+			// Delete the current file (which represents the delete marker)
+			if err := db.bucketFs.Remove(objectFilePath); err != nil {
+				return result, err
+			}
+		}
+
+		// Generate version ID for the delete marker
+		deleteMarkerID := db.nextVersion()
+		result.IsDeleteMarker = true
+		result.VersionID = deleteMarkerID
+		return result, nil
 	}
 
 	return result, db.deleteObjectLocked(bucketName, objectName)
@@ -571,6 +665,347 @@ func (db *MultiBucketBackend) DeleteMulti(bucketName string, objects ...string) 
 	return result, nil
 }
 
+// VersioningConfiguration returns the versioning configuration for the bucket
+func (db *MultiBucketBackend) VersioningConfiguration(bucketName string) (gofakes3.VersioningConfiguration, error) {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	exists, err := afero.Exists(db.bucketFs, bucketName)
+	if err != nil {
+		return gofakes3.VersioningConfiguration{}, err
+	}
+	if !exists {
+		return gofakes3.VersioningConfiguration{}, gofakes3.BucketNotFound(bucketName)
+	}
+
+	status := db.versioning[bucketName]
+	return gofakes3.VersioningConfiguration{Status: status}, nil
+}
+
+// SetVersioningConfiguration sets the versioning configuration for the bucket
+func (db *MultiBucketBackend) SetVersioningConfiguration(bucketName string, v gofakes3.VersioningConfiguration) error {
+	if v.MFADelete.Enabled() {
+		return gofakes3.ErrNotImplemented
+	}
+
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	exists, err := afero.Exists(db.bucketFs, bucketName)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return gofakes3.BucketNotFound(bucketName)
+	}
+
+	if v.Enabled() {
+		db.versioning[bucketName] = gofakes3.VersioningEnabled
+	} else if db.versioning[bucketName] == gofakes3.VersioningEnabled {
+		db.versioning[bucketName] = gofakes3.VersioningSuspended
+	}
+
+	return nil
+}
+
+// GetObjectVersion retrieves a specific version of an object
+func (db *MultiBucketBackend) GetObjectVersion(bucketName, objectName string, versionID gofakes3.VersionID, rangeRequest *gofakes3.ObjectRangeRequest) (*gofakes3.Object, error) {
+	if versionID == "" {
+		return db.GetObject(bucketName, objectName, rangeRequest)
+	}
+
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Check bucket exists
+	exists, err := afero.Exists(db.bucketFs, bucketName)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, gofakes3.BucketNotFound(bucketName)
+	}
+
+	versionPath := db.versionPath(bucketName, objectName, versionID)
+
+	f, err := db.bucketFs.Open(versionPath)
+	if os.IsNotExist(err) {
+		return nil, gofakes3.ErrNoSuchVersion
+	} else if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+		}
+	}()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	size, mtime := stat.Size(), stat.ModTime()
+
+	var rdr io.ReadCloser = f
+	rnge, err := rangeRequest.Range(size)
+	if err != nil {
+		return nil, err
+	}
+
+	if rnge != nil {
+		if _, err := f.Seek(rnge.Start, io.SeekStart); err != nil {
+			return nil, err
+		}
+		rdr = limitReadCloser(rdr, f.Close, rnge.Length)
+	}
+
+	meta, err := db.metaStore.loadMeta(bucketName, objectName+"-version-"+string(versionID), size, mtime)
+	if err != nil {
+		return nil, err
+	}
+
+	return &gofakes3.Object{
+		Name:      objectName,
+		Hash:      meta.Hash,
+		Metadata:  meta.Meta,
+		Size:      size,
+		Range:     rnge,
+		VersionID: versionID,
+		Contents:  rdr,
+	}, nil
+}
+
+// HeadObjectVersion retrieves metadata for a specific version of an object
+func (db *MultiBucketBackend) HeadObjectVersion(bucketName, objectName string, versionID gofakes3.VersionID) (*gofakes3.Object, error) {
+	if versionID == "" {
+		return db.HeadObject(bucketName, objectName)
+	}
+
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Check bucket exists
+	exists, err := afero.Exists(db.bucketFs, bucketName)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, gofakes3.BucketNotFound(bucketName)
+	}
+
+	versionPath := db.versionPath(bucketName, objectName, versionID)
+
+	stat, err := db.bucketFs.Stat(versionPath)
+	if os.IsNotExist(err) {
+		return nil, gofakes3.ErrNoSuchVersion
+	} else if err != nil {
+		return nil, err
+	}
+
+	size, mtime := stat.Size(), stat.ModTime()
+	meta, err := db.metaStore.loadMeta(bucketName, objectName+"-version-"+string(versionID), size, mtime)
+	if err != nil {
+		return nil, err
+	}
+
+	return &gofakes3.Object{
+		Name:      objectName,
+		Hash:      meta.Hash,
+		Metadata:  meta.Meta,
+		Size:      size,
+		VersionID: versionID,
+		Contents:  s3io.NoOpReadCloser{},
+	}, nil
+}
+
+// DeleteObjectVersion permanently deletes a specific version of an object
+func (db *MultiBucketBackend) DeleteObjectVersion(bucketName, objectName string, versionID gofakes3.VersionID) (gofakes3.ObjectDeleteResult, error) {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Check bucket exists
+	exists, err := afero.Exists(db.bucketFs, bucketName)
+	if err != nil {
+		return gofakes3.ObjectDeleteResult{}, err
+	}
+	if !exists {
+		return gofakes3.ObjectDeleteResult{}, gofakes3.BucketNotFound(bucketName)
+	}
+
+	versionPath := db.versionPath(bucketName, objectName, versionID)
+
+	// S3 does not report an error when attempting to delete a version that does not exist
+	if err := db.bucketFs.Remove(versionPath); err != nil && !os.IsNotExist(err) {
+		return gofakes3.ObjectDeleteResult{}, err
+	}
+
+	metaPath := db.metaStore.metaPath(bucketName, objectName+"-version-"+string(versionID))
+	if err := db.metaStore.deleteMeta(metaPath); err != nil {
+		return gofakes3.ObjectDeleteResult{}, err
+	}
+
+	return gofakes3.ObjectDeleteResult{VersionID: versionID}, nil
+}
+
+// DeleteMultiVersions deletes multiple object versions
+func (db *MultiBucketBackend) DeleteMultiVersions(bucketName string, objects ...gofakes3.ObjectID) (gofakes3.MultiDeleteResult, error) {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Check bucket exists
+	exists, err := afero.Exists(db.bucketFs, bucketName)
+	if err != nil {
+		return gofakes3.MultiDeleteResult{}, err
+	}
+	if !exists {
+		return gofakes3.MultiDeleteResult{}, gofakes3.BucketNotFound(bucketName)
+	}
+
+	var result gofakes3.MultiDeleteResult
+
+	for _, object := range objects {
+		if object.VersionID != "" {
+			_, err := db.DeleteObjectVersion(bucketName, object.Key, gofakes3.VersionID(object.VersionID))
+			if err != nil {
+				log.Println("delete version failed:", err)
+				result.Error = append(result.Error, gofakes3.ErrorResult{
+					Code:    gofakes3.ErrInternal,
+					Message: gofakes3.ErrInternal.Message(),
+					Key:     object.Key,
+				})
+			} else {
+				result.Deleted = append(result.Deleted, object)
+			}
+		} else {
+			if err := db.deleteObjectLocked(bucketName, object.Key); err != nil {
+				log.Println("delete object failed:", err)
+				result.Error = append(result.Error, gofakes3.ErrorResult{
+					Code:    gofakes3.ErrInternal,
+					Message: gofakes3.ErrInternal.Message(),
+					Key:     object.Key,
+				})
+			} else {
+				result.Deleted = append(result.Deleted, object)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// ListBucketVersions lists all versions of all objects in a bucket
+func (db *MultiBucketBackend) ListBucketVersions(bucketName string, prefix *gofakes3.Prefix, page *gofakes3.ListBucketVersionsPage) (*gofakes3.ListBucketVersionsResult, error) {
+	if prefix == nil {
+		prefix = emptyPrefix
+	}
+	if page == nil {
+		page = &gofakes3.ListBucketVersionsPage{}
+	}
+
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Check bucket exists
+	stat, err := db.bucketFs.Stat(filepath.FromSlash(bucketName))
+	if os.IsNotExist(err) {
+		return nil, gofakes3.BucketNotFound(bucketName)
+	} else if err != nil {
+		return nil, err
+	} else if !stat.IsDir() {
+		return nil, fmt.Errorf("gofakes3: expected %q to be a bucket path", bucketName)
+	}
+
+	result := gofakes3.NewListBucketVersionsResult(bucketName, prefix, page)
+
+	// Walk the filesystem and collect all objects and versions
+	if err := afero.Walk(db.bucketFs, filepath.FromSlash(bucketName), func(filePath string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+
+		objectPath := filepath.ToSlash(filePath)
+		parts := strings.SplitN(objectPath, "/", 2)
+		if len(parts) != 2 {
+			return nil // Skip bucket root files
+		}
+		objectName := parts[1]
+
+		// Skip .versions directory in main listing
+		if strings.HasPrefix(objectName, ".versions/") {
+			return nil
+		}
+
+		var match gofakes3.PrefixMatch
+		if !prefix.Match(objectName, &match) {
+			return nil
+		}
+
+		if match.CommonPrefix {
+			result.AddPrefix(match.MatchedPart)
+			return nil
+		}
+
+		size := info.Size()
+		mtime := info.ModTime()
+		meta, err := db.metaStore.loadMeta(bucketName, objectName, size, mtime)
+		if err != nil {
+			return err
+		}
+
+		// Add current version
+		ver := &gofakes3.Version{
+			Key:          objectName,
+			IsLatest:     true,
+			LastModified: gofakes3.NewContentTime(mtime),
+			Size:         size,
+			ETag:         gofakes3.FormatETag(meta.Hash),
+		}
+		status := db.versioning[bucketName]
+		if status != gofakes3.VersioningNone {
+			ver.VersionID = "null" // Current version when versioning is enabled
+		}
+		result.Versions = append(result.Versions, ver)
+
+		// List old versions from .versions directory
+		versionsDir := filepath.FromSlash(path.Join(bucketName, ".versions", objectName))
+		versionEntries, err := afero.ReadDir(db.bucketFs, versionsDir)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+
+		for _, vEntry := range versionEntries {
+			if vEntry.IsDir() {
+				continue
+			}
+
+			versionID := gofakes3.VersionID(vEntry.Name())
+			vSize := vEntry.Size()
+			vMtime := vEntry.ModTime()
+			vMeta, err := db.metaStore.loadMeta(bucketName, objectName+"-version-"+string(versionID), vSize, vMtime)
+			if err != nil {
+				return err
+			}
+
+			oldVer := &gofakes3.Version{
+				Key:          objectName,
+				VersionID:    versionID,
+				IsLatest:     false,
+				LastModified: gofakes3.NewContentTime(vMtime),
+				Size:         vSize,
+				ETag:         gofakes3.FormatETag(vMeta.Hash),
+			}
+			result.Versions = append(result.Versions, oldVer)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
 // getConditionalObjectInfo returns information about an object for conditional checking.
 // This method assumes the backend lock is already held.
 func (db *MultiBucketBackend) getConditionalObjectInfo(bucketName, objectName string) (*gofakes3.ConditionalObjectInfo, error) {
@@ -595,4 +1030,103 @@ func (db *MultiBucketBackend) getConditionalObjectInfo(bucketName, objectName st
 		Exists: true,
 		Hash:   meta.Hash,
 	}, nil
+}
+
+// nextVersion generates a new version ID. Assumes lock is held.
+func (db *MultiBucketBackend) nextVersion() gofakes3.VersionID {
+	v, scr := db.versionGenerator.Next(db.versionScratch)
+	db.versionScratch = scr
+	return v
+}
+
+// versionPath returns the filesystem path for a versioned object
+func (db *MultiBucketBackend) versionPath(bucketName, objectName string, versionID gofakes3.VersionID) string {
+	return filepath.FromSlash(path.Join(bucketName, ".versions", objectName, string(versionID)))
+}
+
+// moveToVersions moves the current version of an object to the versions directory
+func (db *MultiBucketBackend) moveToVersions(bucketName, objectName string, versionID gofakes3.VersionID) error {
+	srcPath := filepath.FromSlash(path.Join(bucketName, objectName))
+	dstPath := db.versionPath(bucketName, objectName, versionID)
+	dstDir := filepath.Dir(dstPath)
+
+	// Create versions directory
+	if err := db.bucketFs.MkdirAll(dstDir, db.dirMode); err != nil {
+		return err
+	}
+
+	// Read the current file
+	data, err := afero.ReadFile(db.bucketFs, srcPath)
+	if err != nil {
+		return err
+	}
+
+	// Write to version path
+	if err := afero.WriteFile(db.bucketFs, dstPath, data, 0666); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ensureMeta loads or creates metadata for an object, generating a version ID if needed
+func (db *MultiBucketBackend) ensureMeta(
+	bucket string,
+	objectName string,
+	size int64,
+	mtime time.Time,
+) (meta *Metadata, err error) {
+	existingMeta, err := db.metaStore.loadMeta(bucket, objectName, size, mtime)
+	if errors.Is(err, os.ErrNotExist) {
+		// File exists but no metadata - this is an externally added file
+		fullPath := filepath.FromSlash(path.Join(bucket, objectName))
+		f, err := db.bucketFs.Open(fullPath)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+
+		hasher := md5.New()
+		if _, err := io.Copy(hasher, f); err != nil {
+			return nil, err
+		}
+
+		hash := hasher.Sum(nil)
+
+		// Generate version ID if versioning is enabled
+		var versionID string
+		if db.versioning[bucket] == gofakes3.VersioningEnabled {
+			versionID = string(db.nextVersion())
+		}
+
+		newMeta := &Metadata{
+			File:      path.Join(bucket, objectName),
+			ModTime:   mtime,
+			Size:      size,
+			Hash:      hash,
+			Meta:      map[string]string{},
+			VersionID: versionID,
+		}
+
+		// Save the generated metadata
+		if err := db.metaStore.saveMeta(db.metaStore.metaPath(bucket, objectName), newMeta); err != nil {
+			return nil, err
+		}
+
+		return newMeta, nil
+
+	} else if err != nil {
+		return nil, err
+
+	} else {
+		// Metadata exists - check if we need to add a version ID
+		if existingMeta.VersionID == "" && db.versioning[bucket] == gofakes3.VersioningEnabled {
+			// File existed before versioning was enabled, assign it a version ID now
+			existingMeta.VersionID = string(db.nextVersion())
+			if err := db.metaStore.saveMeta(db.metaStore.metaPath(bucket, objectName), existingMeta); err != nil {
+				return nil, err
+			}
+		}
+		return existingMeta, nil
+	}
 }

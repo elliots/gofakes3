@@ -318,3 +318,341 @@ func TestMultiCreateBucket(t *testing.T) {
 		t.Fatal()
 	}
 }
+
+// versionedTestingBackends returns backends that implement VersionedBackend
+func versionedTestingBackends(t *testing.T) []gofakes3.VersionedBackend {
+	t.Helper()
+
+	// Use in-memory filesystems for testing to avoid persistence issues
+	// Use separate filesystems for data and metadata to avoid conflicts
+	singleDataFs := afero.NewMemMapFs()
+	singleMetaFs := afero.NewMemMapFs()
+	single, err := SingleBucket("test", singleDataFs, singleMetaFs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	multiFs := afero.NewMemMapFs()
+	// multiFs := afero.NewBasePathFs(afero.NewOsFs(), fmt.Sprintf("tmpdata/%s-%d", t.Name(), time.Now().Unix()))
+	multi, err := MultiBucket(multiFs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := multi.CreateBucket("test"); err != nil {
+		t.Fatal(err)
+	}
+
+	backends := []gofakes3.VersionedBackend{single, multi}
+	return backends
+}
+
+func TestAferoVersioningBasic(t *testing.T) {
+	backends := versionedTestingBackends(t)
+
+	for _, backend := range backends {
+		t.Run(fmt.Sprintf("%T", backend), func(t *testing.T) {
+			// Initially, versioning should be disabled
+			config, err := backend.VersioningConfiguration("test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.Status != gofakes3.VersioningNone {
+				t.Fatalf("expected VersioningNone, got %q", config.Status)
+			}
+
+			// Enable versioning
+			err = backend.SetVersioningConfiguration("test", gofakes3.VersioningConfiguration{
+				Status: gofakes3.VersioningEnabled,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Verify versioning is enabled
+			config, err = backend.VersioningConfiguration("test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.Status != gofakes3.VersioningEnabled {
+				t.Fatalf("expected VersioningEnabled, got %q", config.Status)
+			}
+
+			// Suspend versioning
+			err = backend.SetVersioningConfiguration("test", gofakes3.VersioningConfiguration{
+				Status: gofakes3.VersioningSuspended,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Verify versioning is suspended
+			config, err = backend.VersioningConfiguration("test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.Status != gofakes3.VersioningSuspended {
+				t.Fatalf("expected VersioningSuspended, got %q", config.Status)
+			}
+		})
+	}
+}
+
+func TestAferoObjectVersions(t *testing.T) {
+	backends := versionedTestingBackends(t)
+
+	for _, backend := range backends {
+		t.Run(fmt.Sprintf("%T", backend), func(t *testing.T) {
+			// Enable versioning
+			err := backend.SetVersioningConfiguration("test", gofakes3.VersioningConfiguration{
+				Status: gofakes3.VersioningEnabled,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Create first version
+			contents1 := []byte("version 1 content")
+			result1, err := backend.(gofakes3.Backend).PutObject("test", "object", map[string]string{}, bytes.NewReader(contents1), int64(len(contents1)), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result1.VersionID == "" {
+				t.Fatal("expected version ID for first version")
+			}
+			v1 := result1.VersionID
+			t.Logf("Version 1 ID: %s", v1)
+
+			// Create second version
+			contents2 := []byte("version 2 content")
+			result2, err := backend.(gofakes3.Backend).PutObject("test", "object", map[string]string{}, bytes.NewReader(contents2), int64(len(contents2)), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result2.VersionID == "" {
+				t.Fatal("expected version ID for second version")
+			}
+			if result2.VersionID == v1 {
+				t.Fatal("version IDs should be different")
+			}
+			v2 := result2.VersionID
+			t.Logf("Version 2 ID: %s", v2)
+
+			// Create third version
+			contents3 := []byte("version 3 content")
+			result3, err := backend.(gofakes3.Backend).PutObject("test", "object", map[string]string{}, bytes.NewReader(contents3), int64(len(contents3)), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result3.VersionID == "" {
+				t.Fatal("expected version ID for third version")
+			}
+			v3 := result3.VersionID
+			t.Logf("Version 3 ID: %s", v3)
+
+			// Get current version (should be version 3)
+			obj, err := backend.(gofakes3.Backend).GetObject("test", "object", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := ioutil.ReadAll(obj.Contents)
+			obj.Contents.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(body, contents3) {
+				t.Fatalf("expected %q, got %q", contents3, body)
+			}
+
+			// CRITICAL TEST: Verify old versions are still accessible after new versions created
+			// Get version 1 (the oldest version, should still be accessible)
+			t.Logf("Verifying old version 1 is accessible: %q", v1)
+			obj1, err := backend.GetObjectVersion("test", "object", v1, nil)
+			if err != nil {
+				t.Fatalf("failed to get old version 1 (%q): %v", v1, err)
+			}
+			body1, err := ioutil.ReadAll(obj1.Contents)
+			obj1.Contents.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(body1, contents1) {
+				t.Fatalf("version 1 content mismatch: expected %q, got %q", contents1, body1)
+			}
+			t.Logf("✓ Version 1 accessible and content correct")
+
+			// Get version 2 (middle version, should also be accessible)
+			t.Logf("Verifying old version 2 is accessible: %q", v2)
+			obj2, err := backend.GetObjectVersion("test", "object", v2, nil)
+			if err != nil {
+				t.Fatalf("failed to get old version 2 (%q): %v", v2, err)
+			}
+			body2, err := ioutil.ReadAll(obj2.Contents)
+			obj2.Contents.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(body2, contents2) {
+				t.Fatalf("version 2 content mismatch: expected %q, got %q", contents2, body2)
+			}
+			t.Logf("✓ Version 2 accessible and content correct")
+
+			// List versions
+			versions, err := backend.ListBucketVersions("test", nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(versions.Versions) != 3 {
+				t.Fatalf("expected 3 versions, got %d", len(versions.Versions))
+			}
+
+			// Delete version 1
+			_, err = backend.DeleteObjectVersion("test", "object", v1)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Verify version 1 is gone
+			_, err = backend.GetObjectVersion("test", "object", v1, nil)
+			if err == nil {
+				t.Fatal("expected error when getting deleted version")
+			}
+
+			// List versions again (should have 2)
+			versions, err = backend.ListBucketVersions("test", nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(versions.Versions) != 2 {
+				t.Fatalf("expected 2 versions after delete, got %d", len(versions.Versions))
+			}
+
+			// Test delete marker
+			deleteResult, err := backend.(gofakes3.Backend).DeleteObject("test", "object")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !deleteResult.IsDeleteMarker {
+				t.Fatal("expected delete marker")
+			}
+			if deleteResult.VersionID == "" {
+				t.Fatal("expected version ID for delete marker")
+			}
+
+			// Getting current object should fail (delete marker)
+			_, err = backend.(gofakes3.Backend).GetObject("test", "object", nil)
+			if err == nil {
+				t.Fatal("expected error when getting object with delete marker")
+			}
+
+			// But we can still get old versions
+			obj2again, err := backend.GetObjectVersion("test", "object", v2, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body2again, err := ioutil.ReadAll(obj2again.Contents)
+			obj2again.Contents.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(body2again, contents2) {
+				t.Fatalf("expected %q, got %q", contents2, body2again)
+			}
+		})
+	}
+}
+
+func TestAferoExternalFileWithVersioning(t *testing.T) {
+	backends := versionedTestingBackends(t)
+
+	for _, backend := range backends {
+		t.Run(fmt.Sprintf("%T", backend), func(t *testing.T) {
+			// Enable versioning
+			err := backend.SetVersioningConfiguration("test", gofakes3.VersioningConfiguration{
+				Status: gofakes3.VersioningEnabled,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Simulate an external file by writing directly to the filesystem
+			var fs afero.Fs
+			switch b := backend.(type) {
+			case *SingleBucketBackend:
+				fs = b.fs
+			case *MultiBucketBackend:
+				fs = b.bucketFs
+			}
+
+			externalContents := []byte("external file content")
+			var filePath string
+			switch backend.(type) {
+			case *SingleBucketBackend:
+				filePath = "external-file"
+			case *MultiBucketBackend:
+				filePath = "test/external-file"
+			}
+
+			err = afero.WriteFile(fs, filePath, externalContents, 0666)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Now read the file through the backend - it should auto-generate metadata and version ID
+			obj, err := backend.(gofakes3.Backend).GetObject("test", "external-file", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := ioutil.ReadAll(obj.Contents)
+			obj.Contents.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(body, externalContents) {
+				t.Fatalf("expected %q, got %q", externalContents, body)
+			}
+
+			// Check that a version ID was assigned
+			if obj.VersionID == "" {
+				t.Fatal("expected version ID to be auto-generated for external file")
+			}
+
+			// Now overwrite the file through PutObject
+			newContents := []byte("updated via PutObject")
+			result, err := backend.(gofakes3.Backend).PutObject("test", "external-file", map[string]string{}, bytes.NewReader(newContents), int64(len(newContents)), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.VersionID == "" {
+				t.Fatal("expected version ID for new version")
+			}
+
+			// The external file should now be a version
+			oldVersion, err := backend.GetObjectVersion("test", "external-file", obj.VersionID, nil)
+			if err != nil {
+				t.Fatalf("failed to get old version of external file: %v", err)
+			}
+			oldBody, err := ioutil.ReadAll(oldVersion.Contents)
+			oldVersion.Contents.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(oldBody, externalContents) {
+				t.Fatalf("expected old version to contain %q, got %q", externalContents, oldBody)
+			}
+
+			// Current version should have new contents
+			current, err := backend.(gofakes3.Backend).GetObject("test", "external-file", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			currentBody, err := ioutil.ReadAll(current.Contents)
+			current.Contents.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(currentBody, newContents) {
+				t.Fatalf("expected current version to contain %q, got %q", newContents, currentBody)
+			}
+		})
+	}
+}

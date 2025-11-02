@@ -7,3 +7,5 @@ s3f_*
 *.test
 *.out
 build/
+
+backend/s3afero/tmpdata/

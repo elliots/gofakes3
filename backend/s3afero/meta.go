@@ -13,11 +13,12 @@ import (
 )
 
 type Metadata struct {
-	File    string
-	ModTime time.Time
-	Size    int64
-	Hash    []byte
-	Meta    map[string]string
+	File      string
+	ModTime   time.Time
+	Size      int64
+	Hash      []byte
+	Meta      map[string]string
+	VersionID string // Version ID for this object
 }
 
 type metaPath struct {
