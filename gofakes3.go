@@ -36,6 +36,7 @@ type GoFakeS3 struct {
 	hostBucket              bool                              // WithHostBucket
 	hostBucketBases         []string                          // WithHostBucketBase
 	autoBucket              bool                              // WithAutoBucket
+	autoBucketVersioning    bool                              // WithAutoBucketVersioning
 	uploader                MultipartBackend
 	log                     Logger
 }
@@ -1086,6 +1087,17 @@ func (g *GoFakeS3) ensureBucketExists(bucket string) error {
 		if err := g.storage.CreateBucket(bucket); err != nil {
 			g.log.Print(LogErr, "autobucket create failed:", err)
 			return ResourceError(ErrNoSuchBucket, bucket)
+		}
+		// Enable versioning on auto-created bucket if requested
+		if g.autoBucketVersioning && g.versioned != nil {
+			if err := g.versioned.SetVersioningConfiguration(bucket, VersioningConfiguration{
+				Status: VersioningEnabled,
+			}); err != nil {
+				g.log.Print(LogErr, "autobucket versioning failed:", err)
+				// Don't fail the request if versioning fails - bucket was still created
+			} else {
+				g.log.Print(LogInfo, "enabled versioning on autobucket:", bucket)
+			}
 		}
 	} else if !exists {
 		return ResourceError(ErrNoSuchBucket, bucket)

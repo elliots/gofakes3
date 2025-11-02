@@ -40,6 +40,7 @@ type fakeS3Flags struct {
 	autoBucket      bool
 	insecureCORS    bool
 	quiet           bool
+	versioning      bool
 
 	boltDb              string
 	directFsPath        string
@@ -62,6 +63,7 @@ func (f *fakeS3Flags) attach(flagSet *flag.FlagSet) {
 	flagSet.BoolVar(&f.noIntegrity, "no-integrity", false, "Pass this flag to disable Content-MD5 validation when uploading.")
 	flagSet.BoolVar(&f.insecureCORS, "insecure-cors", false, "If true, CORS headers in preflight requests will always allow anything.")
 	flagSet.BoolVar(&f.autoBucket, "autobucket", false, "If passed, nonexistent buckets will be created on first use instead of raising an error")
+	flagSet.BoolVar(&f.versioning, "versioning", false, "If passed, versioning will be enabled on the -initialbucket and all auto-created buckets (via -autobucket)")
 	flagSet.BoolVar(&f.hostBucket, "hostbucket", false, ""+
 		"If passed, the bucket name will be extracted from the first segment of the hostname, "+
 		"rather than the first part of the URL path. Disables path-based mode. If you require both, use "+
@@ -256,6 +258,21 @@ func run() error {
 			return fmt.Errorf("gofakes3: could not create initial bucket %q: %v", values.initialBucket, err)
 		}
 		log.Println("created -initialbucket", values.initialBucket)
+
+		// Enable versioning on initial bucket if requested
+		if values.versioning {
+			if versionedBackend, ok := backend.(gofakes3.VersionedBackend); ok {
+				err := versionedBackend.SetVersioningConfiguration(values.initialBucket, gofakes3.VersioningConfiguration{
+					Status: gofakes3.VersioningEnabled,
+				})
+				if err != nil {
+					return fmt.Errorf("gofakes3: could not enable versioning on bucket %q: %v", values.initialBucket, err)
+				}
+				log.Println("enabled versioning on", values.initialBucket)
+			} else {
+				log.Println("warning: backend does not support versioning; -versioning flag ignored")
+			}
+		}
 	}
 
 	logger := gofakes3.GlobalLog()
@@ -271,6 +288,7 @@ func run() error {
 		gofakes3.WithHostBucket(values.hostBucket),
 		gofakes3.WithHostBucketBase(values.hostBucketBases.Values...),
 		gofakes3.WithAutoBucket(values.autoBucket),
+		gofakes3.WithAutoBucketVersioning(values.versioning),
 	}
 
 	if values.insecureCORS {

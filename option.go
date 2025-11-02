@@ -102,6 +102,13 @@ func WithAutoBucket(enabled bool) Option {
 	return func(g *GoFakeS3) { g.autoBucket = enabled }
 }
 
+// WithAutoBucketVersioning instructs GoFakeS3 to enable versioning on buckets that are
+// automatically created via WithAutoBucket. This option has no effect if WithAutoBucket
+// is not enabled, or if the backend does not support versioning.
+func WithAutoBucketVersioning(enabled bool) Option {
+	return func(g *GoFakeS3) { g.autoBucketVersioning = enabled }
+}
+
 // WithInsecureCORS responds with * for all Access-Control-Allow headers.
 func WithInsecureCORS() Option {
 	return func(g *GoFakeS3) { g.wrapCORS = wrapInsecureCORS }
