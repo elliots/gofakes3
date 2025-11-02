@@ -656,3 +656,233 @@ func TestAferoExternalFileWithVersioning(t *testing.T) {
 		})
 	}
 }
+
+func TestListBucketPagination(t *testing.T) {
+	backends := testingBackends(t)
+
+	for _, backend := range backends {
+		t.Run(fmt.Sprintf("%T", backend), func(t *testing.T) {
+			// Create 10 objects
+			for i := 0; i < 10; i++ {
+				key := fmt.Sprintf("object-%02d", i)
+				contents := []byte("test")
+				_, err := backend.PutObject("test", key, nil, bytes.NewReader(contents), int64(len(contents)), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Test 1: List all objects without pagination
+			t.Run("list-all", func(t *testing.T) {
+				prefix := &gofakes3.Prefix{}
+				result, err := backend.ListBucket("test", prefix, gofakes3.ListBucketPage{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(result.Contents) != 10 {
+					t.Fatalf("expected 10 objects, got %d", len(result.Contents))
+				}
+				if result.IsTruncated {
+					t.Fatal("expected IsTruncated=false when listing all objects")
+				}
+			})
+
+			// Test 2: List with MaxKeys=3
+			t.Run("list-with-maxkeys", func(t *testing.T) {
+				prefix := &gofakes3.Prefix{}
+				result, err := backend.ListBucket("test", prefix, gofakes3.ListBucketPage{MaxKeys: 3})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(result.Contents) != 3 {
+					t.Fatalf("expected 3 objects, got %d", len(result.Contents))
+				}
+				if !result.IsTruncated {
+					t.Fatal("expected IsTruncated=true when MaxKeys < total objects")
+				}
+				if result.NextMarker == "" {
+					t.Fatal("expected NextMarker to be set when truncated")
+				}
+				// First page should contain object-00, object-01, object-02
+				if result.Contents[0].Key != "object-00" {
+					t.Fatalf("expected first key to be object-00, got %s", result.Contents[0].Key)
+				}
+				if result.Contents[2].Key != "object-02" {
+					t.Fatalf("expected third key to be object-02, got %s", result.Contents[2].Key)
+				}
+			})
+
+			// Test 3: Use marker to get next page
+			t.Run("list-with-marker", func(t *testing.T) {
+				prefix := &gofakes3.Prefix{}
+				// Get first page
+				firstPage, err := backend.ListBucket("test", prefix, gofakes3.ListBucketPage{MaxKeys: 3})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				// Get second page using marker
+				secondPage, err := backend.ListBucket("test", prefix, gofakes3.ListBucketPage{
+					MaxKeys:   3,
+					Marker:    firstPage.NextMarker,
+					HasMarker: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(secondPage.Contents) != 3 {
+					t.Fatalf("expected 3 objects in second page, got %d", len(secondPage.Contents))
+				}
+				// Second page should contain object-03, object-04, object-05
+				if secondPage.Contents[0].Key != "object-03" {
+					t.Fatalf("expected first key in second page to be object-03, got %s", secondPage.Contents[0].Key)
+				}
+				if !secondPage.IsTruncated {
+					t.Fatal("expected second page to be truncated")
+				}
+			})
+
+			// Test 4: Iterate through all pages
+			t.Run("iterate-all-pages", func(t *testing.T) {
+				prefix := &gofakes3.Prefix{}
+				var allKeys []string
+				var marker string
+				hasMarker := false
+
+				for {
+					result, err := backend.ListBucket("test", prefix, gofakes3.ListBucketPage{
+						MaxKeys:   3,
+						Marker:    marker,
+						HasMarker: hasMarker,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					for _, obj := range result.Contents {
+						allKeys = append(allKeys, obj.Key)
+					}
+
+					if !result.IsTruncated {
+						break
+					}
+
+					marker = result.NextMarker
+					hasMarker = true
+				}
+
+				if len(allKeys) != 10 {
+					t.Fatalf("expected to collect 10 objects across pages, got %d", len(allKeys))
+				}
+
+				// Verify all keys are present
+				for i := 0; i < 10; i++ {
+					expectedKey := fmt.Sprintf("object-%02d", i)
+					if allKeys[i] != expectedKey {
+						t.Fatalf("expected key %s at position %d, got %s", expectedKey, i, allKeys[i])
+					}
+				}
+			})
+
+			// Clean up
+			for i := 0; i < 10; i++ {
+				key := fmt.Sprintf("object-%02d", i)
+				backend.DeleteObject("test", key)
+			}
+		})
+	}
+}
+
+func TestListBucketPaginationWithPrefix(t *testing.T) {
+	backends := testingBackends(t)
+
+	for _, backend := range backends {
+		t.Run(fmt.Sprintf("%T", backend), func(t *testing.T) {
+			// Create objects with prefixes
+			for i := 0; i < 5; i++ {
+				key := fmt.Sprintf("prefix/object-%02d", i)
+				contents := []byte("test")
+				_, err := backend.PutObject("test", key, nil, bytes.NewReader(contents), int64(len(contents)), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Test pagination with file prefix
+			t.Run("file-prefix-pagination", func(t *testing.T) {
+				prefix := &gofakes3.Prefix{Prefix: "prefix/", HasPrefix: true, Delimiter: "/", HasDelimiter: true}
+				result, err := backend.ListBucket("test", prefix, gofakes3.ListBucketPage{MaxKeys: 2})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(result.Contents) != 2 {
+					t.Fatalf("expected 2 objects, got %d", len(result.Contents))
+				}
+				if !result.IsTruncated {
+					t.Fatal("expected IsTruncated=true")
+				}
+
+				// Get next page
+				result, err = backend.ListBucket("test", prefix, gofakes3.ListBucketPage{
+					MaxKeys:   2,
+					Marker:    result.NextMarker,
+					HasMarker: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(result.Contents) != 2 {
+					t.Fatalf("expected 2 objects in second page, got %d", len(result.Contents))
+				}
+			})
+
+			// Clean up
+			for i := 0; i < 5; i++ {
+				key := fmt.Sprintf("prefix/object-%02d", i)
+				backend.DeleteObject("test", key)
+			}
+		})
+	}
+}
+
+func TestListBucketEmptyPrefix(t *testing.T) {
+	backends := testingBackends(t)
+
+	for _, backend := range backends {
+		t.Run(fmt.Sprintf("%T", backend), func(t *testing.T) {
+			// Create one object at root
+			contents := []byte("test")
+			_, err := backend.PutObject("test", "root-object", nil, bytes.NewReader(contents), int64(len(contents)), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Test 1: List non-existent prefix path (should return empty, not error)
+			t.Run("nonexistent-prefix", func(t *testing.T) {
+				prefix := &gofakes3.Prefix{Prefix: "nonexistent/", HasPrefix: true}
+				result, err := backend.ListBucket("test", prefix, gofakes3.ListBucketPage{})
+				if err != nil {
+					t.Fatalf("expected no error for non-existent prefix, got: %v", err)
+				}
+				if len(result.Contents) != 0 {
+					t.Fatalf("expected 0 objects for non-existent prefix, got %d", len(result.Contents))
+				}
+			})
+
+			// Test 2: List non-existent file prefix path (should return empty, not error)
+			t.Run("nonexistent-file-prefix", func(t *testing.T) {
+				prefix := &gofakes3.Prefix{Prefix: "nonexistent/", HasPrefix: true, Delimiter: "/", HasDelimiter: true}
+				result, err := backend.ListBucket("test", prefix, gofakes3.ListBucketPage{})
+				if err != nil {
+					t.Fatalf("expected no error for non-existent file prefix, got: %v", err)
+				}
+				if len(result.Contents) != 0 {
+					t.Fatalf("expected 0 objects for non-existent file prefix, got %d", len(result.Contents))
+				}
+			})
+
+			// Clean up
+			backend.DeleteObject("test", "root-object")
+		})
+	}
+}

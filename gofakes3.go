@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 // GoFakeS3 implements HTTP handlers for processing S3 requests and returning
@@ -236,6 +238,8 @@ func (g *GoFakeS3) listBucket(bucketName string, w http.ResponseWriter, r *http.
 	g.log.Print(LogInfo, "bucketName:", bucketName, "prefix:", prefix, "page:", fmt.Sprintf("%+v", page))
 
 	objects, err := g.storage.ListBucket(bucketName, &prefix, page)
+	spew.Dump("XXXXXXX LIST ERROR", bucketName, err, objects)
+	spew.Dump("XXX", prefix, page)
 	if err != nil {
 		if err == ErrInternalPageNotImplemented && !g.failOnUnimplementedPage {
 			// We have observed (though not yet confirmed) that simple clients
@@ -1230,8 +1234,6 @@ func parsePutConditions(headers http.Header) (*PutConditions, error) {
 		}
 		conditions.IfNoneMatch = &ifNoneMatch
 	}
-
-
 
 	return conditions, nil
 }

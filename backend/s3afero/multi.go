@@ -9,10 +9,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/spf13/afero"
 
 	"github.com/johannesboyne/gofakes3"
@@ -127,32 +129,42 @@ func (db *MultiBucketBackend) ListBucket(bucket string, prefix *gofakes3.Prefix,
 	if err := gofakes3.ValidateBucketName(bucket); err != nil {
 		return nil, gofakes3.BucketNotFound(bucket)
 	}
-	if !page.IsEmpty() {
-		return nil, gofakes3.ErrInternalPageNotImplemented
-	}
 
 	db.lock.Lock()
 	defer db.lock.Unlock()
 
 	path, part, ok := prefix.FilePrefix()
 	if ok {
-		return db.getBucketWithFilePrefixLocked(bucket, path, part)
+		return db.getBucketWithFilePrefixLocked(bucket, path, part, page)
 	} else {
-		return db.getBucketWithArbitraryPrefixLocked(bucket, prefix)
+		return db.getBucketWithArbitraryPrefixLocked(bucket, prefix, page)
 	}
 }
 
-func (db *MultiBucketBackend) getBucketWithFilePrefixLocked(bucket string, prefixPath, prefixPart string) (*gofakes3.ObjectList, error) {
+func (db *MultiBucketBackend) getBucketWithFilePrefixLocked(bucket string, prefixPath, prefixPart string, page gofakes3.ListBucketPage) (*gofakes3.ObjectList, error) {
 	bucketPath := path.Join(bucket, prefixPath)
+
+	spew.Dump("XXXXXXX LIST PREFIX", bucketPath, prefixPart, page)
 
 	dirEntries, err := afero.ReadDir(db.bucketFs, filepath.FromSlash(bucketPath))
 	if os.IsNotExist(err) {
-		return nil, gofakes3.BucketNotFound(bucket)
+		spew.Dump("XXXXXXX LIST PREFIX NOT EXIST", bucketPath)
+		// Prefix path doesn't exist - return empty list, not an error
+		return gofakes3.NewObjectList(), nil
 	} else if err != nil {
 		return nil, err
 	}
 
 	response := gofakes3.NewObjectList()
+
+	// Sort entries for consistent ordering
+	sort.Slice(dirEntries, func(i, j int) bool {
+		return dirEntries[i].Name() < dirEntries[j].Name()
+	})
+
+	var count int64
+	var lastKey string
+	passedMarker := !page.HasMarker
 
 	for _, entry := range dirEntries {
 		object := entry.Name()
@@ -164,9 +176,18 @@ func (db *MultiBucketBackend) getBucketWithFilePrefixLocked(bucket string, prefi
 			continue
 		}
 
+		// Handle marker - skip until we pass it
+		if !passedMarker {
+			if objectPath > page.Marker {
+				passedMarker = true
+			} else {
+				continue
+			}
+		}
+
 		if entry.IsDir() {
 			response.AddPrefix(path.Join(prefixPath, prefixPart, entry.Name()) + "/")
-
+			lastKey = path.Join(prefixPath, prefixPart, entry.Name()) + "/"
 		} else {
 			size := entry.Size()
 			mtime := entry.ModTime()
@@ -182,13 +203,24 @@ func (db *MultiBucketBackend) getBucketWithFilePrefixLocked(bucket string, prefi
 				ETag:         gofakes3.FormatETag(meta.Hash),
 				Size:         size,
 			})
+			lastKey = objectPath
+		}
+
+		count++
+		if page.MaxKeys > 0 && count >= page.MaxKeys {
+			// Check if there are more entries
+			response.IsTruncated = (entry != dirEntries[len(dirEntries)-1])
+			if response.IsTruncated {
+				response.NextMarker = lastKey
+			}
+			break
 		}
 	}
 
 	return response, nil
 }
 
-func (db *MultiBucketBackend) getBucketWithArbitraryPrefixLocked(bucket string, prefix *gofakes3.Prefix) (*gofakes3.ObjectList, error) {
+func (db *MultiBucketBackend) getBucketWithArbitraryPrefixLocked(bucket string, prefix *gofakes3.Prefix, page gofakes3.ListBucketPage) (*gofakes3.ObjectList, error) {
 	stat, err := db.bucketFs.Stat(filepath.FromSlash(bucket))
 	if os.IsNotExist(err) {
 		return nil, gofakes3.BucketNotFound(bucket)
@@ -198,7 +230,14 @@ func (db *MultiBucketBackend) getBucketWithArbitraryPrefixLocked(bucket string, 
 		return nil, fmt.Errorf("gofakes3: expected %q to be a bucket path", bucket)
 	}
 
-	response := gofakes3.NewObjectList()
+	// Collect all matching items first, then sort and paginate
+	type item struct {
+		key   string
+		size  int64
+		mtime time.Time
+		hash  []byte
+	}
+	var items []item
 
 	if err := afero.Walk(db.bucketFs, filepath.FromSlash(bucket), func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -223,17 +262,50 @@ func (db *MultiBucketBackend) getBucketWithArbitraryPrefixLocked(bucket string, 
 			return err
 		}
 
-		response.Add(&gofakes3.Content{
-			Key:          objectName,
-			LastModified: gofakes3.NewContentTime(mtime),
-			ETag:         gofakes3.FormatETag(meta.Hash),
-			Size:         size,
+		items = append(items, item{
+			key:   objectName,
+			size:  size,
+			mtime: mtime,
+			hash:  meta.Hash,
 		})
 
 		return nil
 
 	}); err != nil {
 		return nil, err
+	}
+
+	// Sort items lexicographically
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].key < items[j].key
+	})
+
+	response := gofakes3.NewObjectList()
+
+	// Apply marker and pagination
+	var count int64
+	for i, item := range items {
+		// Skip items until we pass the marker
+		if page.HasMarker && item.key <= page.Marker {
+			continue
+		}
+
+		response.Add(&gofakes3.Content{
+			Key:          item.key,
+			LastModified: gofakes3.NewContentTime(item.mtime),
+			ETag:         gofakes3.FormatETag(item.hash),
+			Size:         item.size,
+		})
+
+		count++
+		if page.MaxKeys > 0 && count >= page.MaxKeys {
+			// Check if there are more items
+			if i < len(items)-1 {
+				response.IsTruncated = true
+				response.NextMarker = item.key
+			}
+			break
+		}
 	}
 
 	return response, nil
