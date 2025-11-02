@@ -354,11 +354,13 @@ func (db *SingleBucketBackend) HeadObject(bucketName, objectName string) (*gofak
 	}
 
 	return &gofakes3.Object{
-		Name:     objectName,
-		Hash:     meta.Hash,
-		Metadata: meta.Meta,
-		Size:     size,
-		Contents: s3io.NoOpReadCloser{},
+		Name:         objectName,
+		Hash:         meta.Hash,
+		Metadata:     meta.Meta,
+		Size:         size,
+		LastModified: mtime,
+		VersionID:    gofakes3.VersionID(meta.VersionID),
+		Contents:     s3io.NoOpReadCloser{},
 	}, nil
 }
 
@@ -411,13 +413,14 @@ func (db *SingleBucketBackend) GetObject(bucketName, objectName string, rangeReq
 	}
 
 	return &gofakes3.Object{
-		Name:      objectName,
-		Hash:      meta.Hash,
-		Metadata:  meta.Meta,
-		Size:      size,
-		Range:     rnge,
-		VersionID: gofakes3.VersionID(meta.VersionID),
-		Contents:  rdr,
+		Name:         objectName,
+		Hash:         meta.Hash,
+		Metadata:     meta.Meta,
+		Size:         size,
+		Range:        rnge,
+		LastModified: mtime,
+		VersionID:    gofakes3.VersionID(meta.VersionID),
+		Contents:     rdr,
 	}, nil
 }
 

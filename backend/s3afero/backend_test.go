@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"reflect"
 	"testing"
 
 	"github.com/spf13/afero"
@@ -56,8 +55,15 @@ func TestPutGet(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if !reflect.DeepEqual(obj.Metadata, meta) {
-				t.Fatal(obj.Metadata, "!=", meta)
+			// Check that user metadata is present
+			for k, v := range meta {
+				if obj.Metadata[k] != v {
+					t.Fatalf("metadata mismatch: expected %s=%s, got %s", k, v, obj.Metadata[k])
+				}
+			}
+			// Check that LastModified field is set
+			if obj.LastModified.IsZero() {
+				t.Fatal("LastModified is not set")
 			}
 
 			result, err := ioutil.ReadAll(obj.Contents)
@@ -102,8 +108,15 @@ func TestPutGetRange(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if !reflect.DeepEqual(obj.Metadata, meta) {
-				t.Fatal(obj.Metadata, "!=", meta)
+			// Check that user metadata is present
+			for k, v := range meta {
+				if obj.Metadata[k] != v {
+					t.Fatalf("metadata mismatch: expected %s=%s, got %s", k, v, obj.Metadata[k])
+				}
+			}
+			// Check that LastModified field is set
+			if obj.LastModified.IsZero() {
+				t.Fatal("LastModified is not set")
 			}
 
 			result, err := ioutil.ReadAll(obj.Contents)

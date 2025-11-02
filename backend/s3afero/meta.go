@@ -3,6 +3,7 @@ package s3afero
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"hash/fnv"
 	"os"
 	"path/filepath"
@@ -71,8 +72,13 @@ func (ms *metaStore) loadMeta(bucket string, object string, size int64, mtime ti
 	fullPath := metaPath.FilePath()
 
 	bts, err := afero.ReadFile(ms.fs, fullPath)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
+	if err != nil {
+		// Check if it's a "not exist" error - this includes both file and directory not existing
+		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+			// Continue to check modification time below
+		} else {
+			return nil, err
+		}
 	}
 
 	var meta Metadata

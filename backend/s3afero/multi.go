@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/spf13/afero"
 
 	"github.com/johannesboyne/gofakes3"
@@ -144,11 +143,8 @@ func (db *MultiBucketBackend) ListBucket(bucket string, prefix *gofakes3.Prefix,
 func (db *MultiBucketBackend) getBucketWithFilePrefixLocked(bucket string, prefixPath, prefixPart string, page gofakes3.ListBucketPage) (*gofakes3.ObjectList, error) {
 	bucketPath := path.Join(bucket, prefixPath)
 
-	spew.Dump("XXXXXXX LIST PREFIX", bucketPath, prefixPart, page)
-
 	dirEntries, err := afero.ReadDir(db.bucketFs, filepath.FromSlash(bucketPath))
 	if os.IsNotExist(err) {
-		spew.Dump("XXXXXXX LIST PREFIX NOT EXIST", bucketPath)
 		// Prefix path doesn't exist - return empty list, not an error
 		return gofakes3.NewObjectList(), nil
 	} else if err != nil {
@@ -192,7 +188,7 @@ func (db *MultiBucketBackend) getBucketWithFilePrefixLocked(bucket string, prefi
 			size := entry.Size()
 			mtime := entry.ModTime()
 
-			meta, err := db.metaStore.loadMeta(bucket, objectPath, size, mtime)
+			meta, err := db.ensureMeta(bucket, objectPath, size, mtime)
 			if err != nil {
 				return nil, err
 			}
@@ -257,7 +253,7 @@ func (db *MultiBucketBackend) getBucketWithArbitraryPrefixLocked(bucket string, 
 
 		size := info.Size()
 		mtime := info.ModTime()
-		meta, err := db.metaStore.loadMeta(bucket, objectName, size, mtime)
+		meta, err := db.ensureMeta(bucket, objectName, size, mtime)
 		if err != nil {
 			return err
 		}
@@ -430,11 +426,13 @@ func (db *MultiBucketBackend) HeadObject(bucketName, objectName string) (*gofake
 	}
 
 	return &gofakes3.Object{
-		Name:     objectName,
-		Hash:     meta.Hash,
-		Metadata: meta.Meta,
-		Size:     size,
-		Contents: s3io.NoOpReadCloser{},
+		Name:         objectName,
+		Hash:         meta.Hash,
+		Metadata:     meta.Meta,
+		Size:         size,
+		LastModified: mtime,
+		VersionID:    gofakes3.VersionID(meta.VersionID),
+		Contents:     s3io.NoOpReadCloser{},
 	}, nil
 }
 
@@ -493,13 +491,14 @@ func (db *MultiBucketBackend) GetObject(bucketName, objectName string, rangeRequ
 	}
 
 	return &gofakes3.Object{
-		Name:      objectName,
-		Hash:      meta.Hash,
-		Metadata:  meta.Meta,
-		Range:     rnge,
-		Size:      size,
-		VersionID: gofakes3.VersionID(meta.VersionID),
-		Contents:  rdr,
+		Name:         objectName,
+		Hash:         meta.Hash,
+		Metadata:     meta.Meta,
+		Range:        rnge,
+		Size:         size,
+		LastModified: mtime,
+		VersionID:    gofakes3.VersionID(meta.VersionID),
+		Contents:     rdr,
 	}, nil
 }
 

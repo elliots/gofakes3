@@ -17,12 +17,13 @@ const (
 //
 // You MUST always call Contents.Close() otherwise you may leak resources.
 type Object struct {
-	Name     string
-	Metadata map[string]string
-	Size     int64
-	Contents io.ReadCloser
-	Hash     []byte
-	Range    *ObjectRange
+	Name         string
+	Metadata     map[string]string
+	Size         int64
+	Contents     io.ReadCloser
+	Hash         []byte
+	Range        *ObjectRange
+	LastModified time.Time
 
 	// VersionID will be empty if bucket versioning has not been enabled.
 	VersionID VersionID

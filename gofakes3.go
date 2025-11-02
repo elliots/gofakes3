@@ -15,8 +15,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/davecgh/go-spew/spew"
 )
 
 // GoFakeS3 implements HTTP handlers for processing S3 requests and returning
@@ -238,8 +236,6 @@ func (g *GoFakeS3) listBucket(bucketName string, w http.ResponseWriter, r *http.
 	g.log.Print(LogInfo, "bucketName:", bucketName, "prefix:", prefix, "page:", fmt.Sprintf("%+v", page))
 
 	objects, err := g.storage.ListBucket(bucketName, &prefix, page)
-	spew.Dump("XXXXXXX LIST ERROR", bucketName, err, objects)
-	spew.Dump("XXX", prefix, page)
 	if err != nil {
 		if err == ErrInternalPageNotImplemented && !g.failOnUnimplementedPage {
 			// We have observed (though not yet confirmed) that simple clients
@@ -524,6 +520,11 @@ func (g *GoFakeS3) writeGetOrHeadObjectResponse(obj *Object, w http.ResponseWrit
 		w.Header().Set(mk, mv)
 	}
 
+	// Set Last-Modified header from the dedicated field
+	if !obj.LastModified.IsZero() {
+		w.Header().Set("Last-Modified", obj.LastModified.UTC().Format(http.TimeFormat))
+	}
+
 	if obj.VersionID != "" {
 		w.Header().Set("x-amz-version-id", string(obj.VersionID))
 	}
@@ -535,9 +536,9 @@ func (g *GoFakeS3) writeGetOrHeadObjectResponse(obj *Object, w http.ResponseWrit
 		return ErrNotModified
 	}
 
-	lastModified, _ := time.Parse(http.TimeFormat, obj.Metadata["Last-Modified"])
+	// Check If-Modified-Since using the dedicated LastModified field
 	ifModifiedSince, _ := time.Parse(http.TimeFormat, r.Header.Get("If-Modified-Since"))
-	if !lastModified.IsZero() && !ifModifiedSince.Before(lastModified) {
+	if !obj.LastModified.IsZero() && !ifModifiedSince.Before(obj.LastModified) {
 		return ErrNotModified
 	}
 
